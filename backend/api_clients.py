@@ -401,24 +401,36 @@ class WikimediaClient:
                 pages = resp.json().get("query", {}).get("pages", {})
 
             import re
-            # Filter out photos, logos, and unrelated images
+            # Filter out photos, logos, unrelated images, and non-English content
             skip_keywords = ["photo", "photograph", "portrait", "logo", "flag",
                              "championship", "competition", "tournament", "award",
                              "ceremony", "screenshot", "map of"]
+            # Regex to detect non-Latin scripts (Cyrillic, CJK, Arabic, etc.)
+            non_latin_re = re.compile(r'[\u0400-\u04FF\u4E00-\u9FFF\u0600-\u06FF\u0E00-\u0E7F\u3040-\u30FF\uAC00-\uD7AF]')
             for page in sorted(pages.values(), key=lambda p: p.get("index", 999)):
-                title = page.get("title", "").lower()
-                if any(kw in title for kw in skip_keywords):
+                title = page.get("title", "")
+                title_lower = title.lower()
+                if any(kw in title_lower for kw in skip_keywords):
+                    continue
+                # Skip files with non-Latin characters in the title
+                if non_latin_re.search(title):
                     continue
                 imageinfo = page.get("imageinfo", [{}])[0]
                 url = imageinfo.get("url")
                 if url and any(url.lower().endswith(ext) for ext in (".svg", ".png", ".jpg", ".jpeg", ".gif")):
                     extmeta = imageinfo.get("extmetadata", {})
-                    description = extmeta.get("ImageDescription", {}).get("value", "")
-                    description = re.sub(r"<[^>]+>", "", description)[:200]
+                    description_raw = extmeta.get("ImageDescription", {}).get("value", "")
+                    description = re.sub(r"<[^>]+>", "", description_raw)[:200]
+                    # Skip if description is predominantly non-Latin
+                    if description and non_latin_re.search(description):
+                        # Check if it's mostly non-Latin (>30% non-ASCII)
+                        non_ascii = sum(1 for c in description if ord(c) > 127)
+                        if non_ascii > len(description) * 0.3:
+                            continue
                     return {
                         "url": url,
                         "source": "Wikimedia Commons",
-                        "attribution": f"Wikimedia Commons: {page.get('title', 'File')}",
+                        "attribution": f"Wikimedia Commons: {title}",
                         "width": imageinfo.get("width"),
                         "height": imageinfo.get("height"),
                         "description": description,
