@@ -256,8 +256,8 @@ class WikipediaClient:
     def is_available(self):
         return True
 
-    def get_page_image(self, topic):
-        """Get the main image for a Wikipedia article. Returns media dict or None."""
+    def _try_page_image(self, title):
+        """Try to get the main image for an exact Wikipedia article title."""
         try:
             resp = self._session.get(
                 self.API_URL,
@@ -266,7 +266,7 @@ class WikipediaClient:
                     "prop": "pageimages",
                     "format": "json",
                     "piprop": "original",
-                    "titles": topic,
+                    "titles": title,
                 },
                 timeout=10,
             )
@@ -278,14 +278,58 @@ class WikipediaClient:
                     return {
                         "url": original["source"],
                         "source": "Wikipedia",
-                        "attribution": f"Image from Wikipedia article: {topic}",
+                        "attribution": f"Image from Wikipedia article: {title}",
                         "width": original.get("width"),
                         "height": original.get("height"),
                     }
             return None
         except Exception as e:
-            logger.error("Wikipedia image error: %s", e)
+            logger.error("Wikipedia image error for '%s': %s", title, e)
             return None
+
+    def _search_title(self, query):
+        """Use Wikipedia opensearch to fuzzy-match a query to a real article title."""
+        try:
+            resp = self._session.get(
+                self.API_URL,
+                params={
+                    "action": "opensearch",
+                    "search": query,
+                    "limit": 1,
+                    "namespace": 0,
+                    "format": "json",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # opensearch returns [query, [titles], [descriptions], [urls]]
+            if len(data) >= 2 and data[1]:
+                return data[1][0]
+            return None
+        except Exception as e:
+            logger.error("Wikipedia opensearch error: %s", e)
+            return None
+
+    def get_page_image(self, topic):
+        """Get the main image for a Wikipedia article. Returns media dict or None.
+
+        Tries exact title first, then uses opensearch to resolve free-form
+        queries to real article titles.
+        """
+        # Try exact title
+        result = self._try_page_image(topic)
+        if result:
+            return result
+
+        # Fuzzy search: resolve free-form query to a real article title
+        resolved = self._search_title(topic)
+        if resolved and resolved.lower() != topic.lower():
+            result = self._try_page_image(resolved)
+            if result:
+                return result
+
+        return None
 
     def get_summary(self, topic):
         """Get the plain text summary for a Wikipedia article. Returns string or None."""
@@ -316,10 +360,11 @@ class WikimediaClient:
     def is_available(self):
         return True
 
-    def search_diagrams(self, query, limit=5):
+    def search_diagrams(self, query, limit=10):
         """Search Wikimedia Commons for diagrams/charts. Returns media dict or None."""
         try:
-            search_query = f"{query} diagram OR chart OR figure"
+            # Use more specific search to avoid unrelated images
+            search_query = f'"{query}" filetype:svg OR filetype:png (diagram OR schematic OR illustration OR physics OR science)'
             resp = self._session.get(
                 self.API_URL,
                 params={
@@ -336,14 +381,39 @@ class WikimediaClient:
             )
             resp.raise_for_status()
             pages = resp.json().get("query", {}).get("pages", {})
+            if not pages:
+                # Fallback: simpler query without filetype filters
+                resp = self._session.get(
+                    self.API_URL,
+                    params={
+                        "action": "query",
+                        "generator": "search",
+                        "gsrsearch": f"{query} diagram",
+                        "gsrnamespace": "6",
+                        "gsrlimit": limit,
+                        "prop": "imageinfo",
+                        "iiprop": "url|size|extmetadata",
+                        "format": "json",
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                pages = resp.json().get("query", {}).get("pages", {})
+
+            import re
+            # Filter out photos, logos, and unrelated images
+            skip_keywords = ["photo", "photograph", "portrait", "logo", "flag",
+                             "championship", "competition", "tournament", "award",
+                             "ceremony", "screenshot", "map of"]
             for page in sorted(pages.values(), key=lambda p: p.get("index", 999)):
+                title = page.get("title", "").lower()
+                if any(kw in title for kw in skip_keywords):
+                    continue
                 imageinfo = page.get("imageinfo", [{}])[0]
                 url = imageinfo.get("url")
                 if url and any(url.lower().endswith(ext) for ext in (".svg", ".png", ".jpg", ".jpeg", ".gif")):
                     extmeta = imageinfo.get("extmetadata", {})
                     description = extmeta.get("ImageDescription", {}).get("value", "")
-                    # Strip HTML tags from description
-                    import re
                     description = re.sub(r"<[^>]+>", "", description)[:200]
                     return {
                         "url": url,
@@ -484,6 +554,17 @@ class XkcdClient:
         "universe": [2135, 482, 1071],
     }
 
+    # Group keywords by science domain for domain-aware fallback
+    DOMAIN_KEYWORDS = {
+        "physics": ["black hole", "gravity", "quantum", "entanglement", "physics",
+                     "dark matter", "dark energy", "cosmology", "neutrino", "particle",
+                     "energy", "space", "astronomy", "rocket", "planet", "star", "universe"],
+        "biology": ["dna", "gene", "crispr", "biology", "evolution", "virus", "vaccine", "brain"],
+        "climate": ["climate", "temperature", "carbon", "ocean"],
+        "cs": ["neural network", "machine learning", "ai", "computer", "robot"],
+        "math": ["math", "statistics", "chemistry"],
+    }
+
     def __init__(self):
         self._latest_num = None
 
@@ -520,48 +601,68 @@ class XkcdClient:
             logger.error("xkcd fetch error for #%s: %s", num, e)
             return None
 
+    def _get_domain_for_query(self, query_lower):
+        """Determine which science domain a query belongs to."""
+        for domain, keywords in self.DOMAIN_KEYWORDS.items():
+            for kw in keywords:
+                if kw in query_lower:
+                    return domain
+        return None
+
+    def _get_domain_comics(self, domain):
+        """Get all comic numbers for a given science domain."""
+        comics = set()
+        if domain and domain in self.DOMAIN_KEYWORDS:
+            for kw in self.DOMAIN_KEYWORDS[domain]:
+                if kw in self.SCIENCE_COMICS:
+                    comics.update(self.SCIENCE_COMICS[kw])
+        return comics
+
     def search_comics(self, query):
         """Find a relevant xkcd comic by keyword matching. Returns media dict or None."""
         query_lower = query.lower()
 
-        # Check all keywords for matches
+        # Check all keywords — keyword must appear in the query (not reverse)
         matching_comics = set()
         for keyword, nums in self.SCIENCE_COMICS.items():
-            if keyword in query_lower or any(word in keyword for word in query_lower.split()):
+            if keyword in query_lower:
                 matching_comics.update(nums)
 
         if matching_comics:
             comic_num = random.choice(list(matching_comics))
             return self._fetch_comic(comic_num)
 
-        # Fallback: pick a random science comic from the index
-        all_comics = set()
-        for nums in self.SCIENCE_COMICS.values():
-            all_comics.update(nums)
-        if all_comics:
-            return self._fetch_comic(random.choice(list(all_comics)))
+        # Fallback: pick from same science domain only, not the entire index
+        domain = self._get_domain_for_query(query_lower)
+        domain_comics = self._get_domain_comics(domain)
+        if domain_comics:
+            return self._fetch_comic(random.choice(list(domain_comics)))
 
+        # No domain match at all — return None instead of random comic
         return None
 
 
 # ── Factory ──────────────────────────────────────────────────────────────
 
 def create_api_clients():
-    """Create all API clients from environment variables."""
+    """Create all API clients from environment variables.
+
+    Uses `or None` so empty strings from .env are treated as missing.
+    """
     return {
-        "claude": ClaudeClient(os.environ.get("ANTHROPIC_API_KEY")),
-        "unsplash": UnsplashClient(os.environ.get("UNSPLASH_ACCESS_KEY")),
+        "claude": ClaudeClient(os.environ.get("ANTHROPIC_API_KEY") or None),
+        "unsplash": UnsplashClient(os.environ.get("UNSPLASH_ACCESS_KEY") or None),
         "reddit": RedditClient(
-            os.environ.get("REDDIT_CLIENT_ID"),
-            os.environ.get("REDDIT_CLIENT_SECRET"),
+            os.environ.get("REDDIT_CLIENT_ID") or None,
+            os.environ.get("REDDIT_CLIENT_SECRET") or None,
             os.environ.get("REDDIT_USER_AGENT", "SciScroll/1.0"),
         ),
-        "twitter": TwitterClient(os.environ.get("TWITTER_BEARER_TOKEN")),
+        "twitter": TwitterClient(os.environ.get("TWITTER_BEARER_TOKEN") or None),
         "wikipedia": WikipediaClient(),
         "wikimedia": WikimediaClient(),
         "imgflip": ImgflipClient(
-            os.environ.get("IMGFLIP_USERNAME"),
-            os.environ.get("IMGFLIP_PASSWORD"),
+            os.environ.get("IMGFLIP_USERNAME") or None,
+            os.environ.get("IMGFLIP_PASSWORD") or None,
         ),
         "xkcd": XkcdClient(),
     }
