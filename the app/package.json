@@ -1,0 +1,35 @@
+{
+  "name": "cyphe",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "wiki:example": "npx tsx src/lib/wikipedia.example.ts",
+    "wiki:food": "npx tsx src/lib/wikipedia.example.ts Food",
+    "graph:example": "npx tsx src/lib/graph.example.ts",
+    "api": "npx tsx server/index.ts",
+    "dev:full": "concurrently \"npm run api\" \"npm run dev\"",
+    "dev:all": "concurrently -n api,uhaccs,vite \"npm run api\" \"cd uhaccs26/backend && python server.py\" \"npm run dev\""
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "d3": "^7.9.0",
+    "dotenv": "^17.2.4",
+    "express": "^5.2.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "concurrently": "^9.2.1",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.1"
+  }
+}
